@@ -1186,12 +1186,22 @@ func (g *Generator) generate(file *FileDescriptor) {
 	for _, enum := range g.file.enum {
 		g.generateEnum(enum)
 	}
+
+	goImports := []string{}
+
 	for _, desc := range g.file.desc {
 		// Don't generate virtual messages for maps.
 		if desc.GetOptions().GetMapEntry() {
 			continue
 		}
 		g.generateMessage(desc)
+
+		goInjectBlock := g.GetGoInjectForMessage(desc)
+		messageGoImports := goImportsFromGoInject(goInjectBlock)
+		goImports = append(goImports, messageGoImports...)
+
+		// Inject the code right away
+		g.P(goCodeFromGoInject(goInjectBlock))
 	}
 	for _, ext := range g.file.ext {
 		g.generateExtension(ext)
@@ -1207,7 +1217,7 @@ func (g *Generator) generate(file *FileDescriptor) {
 	rem := g.Buffer
 	g.Buffer = new(bytes.Buffer)
 	g.generateHeader()
-	g.generateImports()
+	g.generateImports(goImports)
 	if !g.writeOutput {
 		return
 	}
@@ -1316,13 +1326,17 @@ func (g *Generator) weak(i int32) bool {
 }
 
 // Generate the imports
-func (g *Generator) generateImports() {
+func (g *Generator) generateImports(extraImports []string) {
 	// We almost always need a proto import.  Rather than computing when we
 	// do, which is tricky when there's a plugin, just import it and
 	// reference it later. The same argument applies to the fmt and math packages.
 	g.P("import " + g.Pkg["proto"] + " " + strconv.Quote(g.ImportPrefix+"github.com/golang/protobuf/proto"))
 	g.P("import " + g.Pkg["fmt"] + ` "fmt"`)
 	g.P("import " + g.Pkg["math"] + ` "math"`)
+	for _, importPath := range extraImports {
+		g.P(`import "` + importPath + `"`)
+	}
+
 	for i, s := range g.file.Dependency {
 		fd := g.fileByName(s)
 		// Do not import our own package.
@@ -1747,6 +1761,9 @@ func (g *Generator) generateMessage(message *Descriptor) {
 	oneofTypeName := make(map[*descriptor.FieldDescriptorProto]string) // without star
 	oneofInsertPoints := make(map[int32]int)                           // oneof_index => offset of g.Buffer
 
+	messageIsBsonCompatible := g.IsMessageBsonCompatible(message)
+	messageIsBsonUpsertable := g.IsMessageBsonUpsertable(message)
+
 	g.PrintComments(message.path)
 	g.P("type ", ccTypeName, " struct {")
 	g.In()
@@ -1783,7 +1800,22 @@ func (g *Generator) generateMessage(message *Descriptor) {
 		fieldName, fieldGetterName := ns[0], ns[1]
 		typename, wiretype := g.GoType(message, field)
 		jsonName := *field.Name
+
+		bsonTag := ""
+		bsonOverride := g.GetBsonTagForField(message, i)
+		if bsonOverride != "" {
+			bsonTag = bsonOverride
+		} else if messageIsBsonCompatible || messageIsBsonUpsertable {
+			bsonTag = LowerCamelCase(*field.Name)
+			if messageIsBsonUpsertable {
+				bsonTag += ",omitempty"
+			}
+		}
+
 		tag := fmt.Sprintf("protobuf:%s json:%q", g.goTag(message, field, wiretype), jsonName+",omitempty")
+		if bsonTag != "" {
+			tag += fmt.Sprintf(" bson:%q", bsonTag)
+		}
 
 		fieldNames[field] = fieldName
 		fieldGetterNames[field] = fieldGetterName
@@ -2663,6 +2695,19 @@ func isASCIILower(c byte) bool {
 // Is c an ASCII digit?
 func isASCIIDigit(c byte) bool {
 	return '0' <= c && c <= '9'
+}
+
+func LowerCamelCase(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	r := []byte(CamelCase(s))
+	// It can be assumed that the first character here is upper-case, convert it
+	// lower-case.
+	r[0] = r[0] | ('a' - 'A')
+
+	return string(r)
 }
 
 // CamelCase returns the CamelCased name.
